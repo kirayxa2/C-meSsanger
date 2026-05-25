@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>C-meSsanger Test Client</title>
+  <style>
+    body { font-family: ui-monospace, monospace; max-width: 820px; margin: 2em auto; padding: 1em; background: #1e1e1e; color: #ddd; }
+    button { padding: .5em 1em; margin: .25em; cursor: pointer; background: #333; color: #ddd; border: 1px solid #555; border-radius: 4px; }
+    button:disabled { opacity: .4; cursor: not-allowed; }
+    input { padding: .4em; margin: .25em; background: #2a2a2a; color: #ddd; border: 1px solid #444; border-radius: 4px; }
+    #log { background: #111; padding: 1em; height: 320px; overflow-y: auto; white-space: pre-wrap; font-size: 12px; border: 1px solid #444; border-radius: 4px; }
+    .row { display: flex; gap: .5em; align-items: center; flex-wrap: wrap; margin: .5em 0; }
+    h1 { font-size: 1.2em; }
+    .pill { display: inline-block; padding: .2em .6em; background: #555; border-radius: 4px; margin-left: .5em; font-size: .8em; }
+    .pill.ok { background: #2a4; }
+  </style>
+</head>
+<body>
+  <h1>C-meSsanger Test Client <span class="pill" id="status">disconnected</span></h1>
+  <div class="row">
+    <input id="name" placeholder="Player name" value="Player1">
+    <button id="create">Create lobby</button>
+  </div>
+  <div class="row">
+    <input id="code" placeholder="Lobby code" maxlength="6" style="text-transform:uppercase">
+    <button id="join">Join lobby</button>
+  </div>
+  <div class="row">
+    <button id="start" disabled>Start (host only)</button>
+    <button id="sendState">Send fake position</button>
+    <input id="chat" placeholder="Chat message">
+    <button id="sendChat">Send chat</button>
+  </div>
+  <div id="log"></div>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const log = (msg) => { $('log').textContent += msg + '\n'; $('log').scrollTop = $('log').scrollHeight; };
+    let ws = null, isHost = false;
+
+    $('create').onclick = async () => {
+      const r = await fetch('/api/lobby', { method: 'POST' });
+      const { code } = await r.json();
+      $('code').value = code;
+      log('Created lobby: ' + code);
+    };
+
+    $('join').onclick = () => {
+      const code = $('code').value.toUpperCase();
+      const name = $('name').value;
+      if (!code) return;
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws?code=${code}&name=${encodeURIComponent(name)}`);
+      $('status').textContent = 'connecting...';
+      $('status').classList.remove('ok');
+      ws.onopen = () => { $('status').textContent = 'connected'; $('status').classList.add('ok'); };
+      ws.onclose = (e) => {
+        $('status').textContent = 'closed: ' + (e.reason || e.code);
+        $('status').classList.remove('ok');
+        $('start').disabled = true;
+      };
+      ws.onerror = () => log('WS error');
+      ws.onmessage = (e) => {
+        const m = JSON.parse(e.data);
+        log('< ' + JSON.stringify(m));
+        if (m.type === 'joined') {
+          isHost = m.you.isHost;
+          $('start').disabled = !isHost;
+        }
+      };
+    };
+
+    $('start').onclick = () => ws && ws.send(JSON.stringify({ type: 'start' }));
+    $('sendState').onclick = () => {
+      const data = { x: Math.random()*100, y: Math.random()*100, z: 0, yaw: Math.random()*360 };
+      ws && ws.send(JSON.stringify({ type: 'state', data }));
+      log('> state ' + JSON.stringify(data));
+    };
+    $('sendChat').onclick = () => {
+      const text = $('chat').value;
+      if (!text || !ws) return;
+      ws.send(JSON.stringify({ type: 'chat', text }));
+      $('chat').value = '';
+    };
+  </script>
+</body>
+</html>
