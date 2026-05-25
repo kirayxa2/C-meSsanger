@@ -169,11 +169,43 @@ ui.on_disconnect  = function() leave() end
 ui.on_dump_status = dumpStatus
 
 -- ----- ticker -----
+-- Poll settings.json every ~2 seconds for external edits. If the user
+-- edits the file in notepad and saves, this picks up the new code and
+-- transparently reconnects.
+local _settings_tick = 0
+local SETTINGS_POLL_TICKS = math.max(1, math.floor(2000 / config.TICK_MS))
+
 LoopAsync(config.TICK_MS, function()
     if sess.joined then
         pushState()
         pollSnapshot()
     end
+
+    _settings_tick = _settings_tick + 1
+    if _settings_tick >= SETTINGS_POLL_TICKS then
+        _settings_tick = 0
+        local changed, parsed = settings.poll_disk()
+        if changed and parsed then
+            local new_code = (tostring(parsed.code or "")):upper()
+            local new_name = tostring(parsed.name or ui.state.name or "Player")
+            if #new_code == 6 and new_code ~= (sess.code or "") then
+                log.info("settings.json changed: code %s -> %s. Reconnecting...",
+                    tostring(sess.code or "(none)"), new_code)
+                ui.state.code = new_code
+                ui.state.name = new_name
+                ui.refresh_inputs()
+                leave()
+                ExecuteWithDelay(500, function()
+                    joinWithCode(new_code, new_name)
+                end)
+            elseif new_name ~= (ui.state.name or "") then
+                ui.state.name = new_name
+                ui.refresh_inputs()
+                log.info("settings.json: name changed to %s (will apply on next connect)", new_name)
+            end
+        end
+    end
+
     return false
 end)
 
@@ -201,5 +233,6 @@ end
 
 log.info("CMessangerMP loaded.  server=%s  saved-lobby=%s  name=%s  tick=%dms",
     config.SERVER_URL, ui.state.code or "(none)", ui.state.name, config.TICK_MS)
-log.info("Hotkeys:  F9 = toggle in-game UI,  F8 = status,  F7 = force rejoin.")
-log.info("Press F9 in game to open the connect window. Type a 6-char lobby code and click Connect or Change room.")
+log.info("Hotkeys:  F9 = toggle in-game UI (if available),  F8 = status,  F7 = force rejoin.")
+log.info("To CHANGE ROOM without restart: open  Mods/CMessangerMP/settings.json  in notepad,")
+log.info("set \"code\" to a new 6-char lobby code, save the file. Mod auto-reconnects within 2 seconds.")

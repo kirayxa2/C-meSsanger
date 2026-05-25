@@ -183,13 +183,84 @@ do
     if not ok then log.error("F9 keybind failed: %s", tostring(err)) end
 end
 
+-- ---- Helper: look up a global through every channel ----
+
+local function get_global(name)
+    local v
+    -- Through _G with metatable (proper lookup)
+    pcall(function() v = _G[name] end)
+    if v ~= nil then return v end
+    -- Raw _G (skip metatable)
+    pcall(function() v = rawget(_G, name) end)
+    if v ~= nil then return v end
+    return nil
+end
+
+-- ---- Diagnostic: dump every plausible UI/render registration global ----
+-- This runs once at mod load. Lets us identify the correct API name in
+-- whatever UE4SS build the user has, since names move between releases.
+do
+    log.info("--- UE4SS API probe (diagnostic) ---")
+    local found = {}
+    local seen = {}
+    local function add(name, kind)
+        if seen[name] then return end
+        seen[name] = true
+        found[#found + 1] = string.format("%s(%s)", name, kind)
+    end
+
+    -- 1) iterate every key visible in _G
+    pcall(function()
+        for k, v in pairs(_G) do
+            if type(k) == "string" then
+                local lower = k:lower()
+                if lower:find("register") or lower:find("imgui")
+                   or lower:find("hook") or lower:find("tab")
+                   or lower:find("draw") or lower:find("render")
+                   or lower:find("custom") or lower:find("ui") then
+                    add(k, type(v))
+                end
+            end
+        end
+    end)
+
+    -- 2) probe specific names directly through _G[name]
+    local probes = {
+        "RegisterImGuiTab", "RegisterImGuiHook", "RegisterCustomEvent",
+        "RegisterTabRenderer", "RegisterUIHook", "RegisterDrawHook",
+        "RegisterPostBeginPlay", "RegisterHook", "RegisterKeyBind",
+        "RegisterProcessConsoleExecPreHook", "RegisterUI",
+        "ImGuiNewFrame", "DrawImGui", "OnDraw",
+    }
+    for _, name in ipairs(probes) do
+        local v = get_global(name)
+        if v ~= nil then add(name, "PROBE:" .. type(v)) end
+    end
+
+    table.sort(found)
+    if #found == 0 then
+        log.info("NO matching globals found. Listing first 30 globals as last resort:")
+        local n = 0
+        pcall(function()
+            for k, v in pairs(_G) do
+                if n < 30 and type(k) == "string" then
+                    log.info("  _G.%s = %s", k, type(v))
+                    n = n + 1
+                end
+            end
+        end)
+    else
+        log.info("Found %d globals matching UI/Register/Hook keywords:", #found)
+        for _, s in ipairs(found) do log.info("  %s", s) end
+    end
+    log.info("--- end probe ---")
+end
+
 -- ---- Try to register the in-game overlay render hook ----
 
 do
     local registered = false
     local tried = {}
-    -- UE4SS spelled this differently in different releases. Try the
-    -- known names; first one that takes our function wins.
     local candidates = {
         "RegisterImGuiHook",
         "RegisterUIHook",
@@ -197,9 +268,11 @@ do
         "RegisterRenderHook",
         "RegisterFrameRender",
         "RegisterCustomImGui",
+        "RegisterUI",
+        "RegisterImGui",
     }
     for _, name in ipairs(candidates) do
-        local fn = rawget(_G, name)
+        local fn = get_global(name)
         if type(fn) == "function" then
             tried[#tried + 1] = name
             local ok, err = pcall(function() fn(overlay_render) end)
@@ -208,24 +281,25 @@ do
                 log.info("In-game overlay registered via %s. Press F9 to toggle.", name)
                 break
             else
-                log.error("%s failed: %s", name, tostring(err))
+                log.error("%s exists but failed: %s", name, tostring(err))
             end
         end
     end
     if not registered then
-        log.info("No in-game overlay API in this UE4SS build (tried: %s). The 'C-meSsanger' tab in the UE4SS Debugging Tools window still works.",
-            table.concat(tried, ", "))
+        log.info("No in-game overlay API found (tried %d candidates: %s).",
+            #tried, tried[1] and table.concat(tried, ", ") or "none of the known names existed")
+        log.info("Use settings.json (auto-reload) or the C-meSsanger tab in UE4SS Debugging Tools.")
     end
 end
 
--- ---- Always also register the UE4SS console tab as a fallback ----
+-- ---- Always also try to register the UE4SS console tab as a fallback ----
 
 do
     local registered = false
     local tried = {}
-    local candidates = { "RegisterImGuiTab", "RegisterTabRenderer" }
+    local candidates = { "RegisterImGuiTab", "RegisterTabRenderer", "RegisterImGuiTabRenderer" }
     for _, name in ipairs(candidates) do
-        local fn = rawget(_G, name)
+        local fn = get_global(name)
         if type(fn) == "function" then
             tried[#tried + 1] = name
             local ok, err = pcall(function() fn("C-meSsanger", tab_content) end)
@@ -234,13 +308,13 @@ do
                 log.info("UE4SS tab registered via %s", name)
                 break
             else
-                log.error("%s failed: %s", name, tostring(err))
+                log.error("%s exists but failed: %s", name, tostring(err))
             end
         end
     end
     if not registered then
-        log.error("No tab API found either (tried: %s). UI is broken on this UE4SS build - sorry, falling back to config.lua + F7.",
-            table.concat(tried, ", "))
+        log.info("No tab API found either. That's fine - settings.json auto-reload still works.")
+        log.info("Edit Mods/CMessangerMP/settings.json in notepad to change room without restart.")
     end
 end
 
