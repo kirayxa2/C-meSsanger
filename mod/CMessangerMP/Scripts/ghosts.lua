@@ -1,37 +1,38 @@
--- Ghost manager: spawns BP_HumanReplicated_C for each remote player and
--- moves it to match their position from the server snapshot.
+-- Ghost manager.
 --
--- This file is wrapped in defensive pcall layers because UE4SS APIs vary
--- between versions and we want a single failure to be loud once, not
--- spam the console every tick.
+-- UE4SS issue #527: UWorld:SpawnActor() and BeginDeferredActorSpawnFromClass
+-- both go through the ProcessEvent hook and crash the game after a few
+-- spawns (or even on the first one for some classes). Stable UE4SS has no
+-- fix as of 2025; PR #864 is about scale, not the crash.
+--
+-- Workaround used here: invoke the native UE console command "summon"
+-- via APlayerController::ConsoleCommand. ConsoleCommand is a UFUNCTION
+-- exposed through Lua, but its native implementation routes the command
+-- through UEngine::Exec / UWorld::Exec which calls SpawnActor directly
+-- in C++ - bypassing UE4SS's ProcessEvent hook and therefore the crash.
+-- Once the actor is in the world we just teleport it every tick with
+-- K2_SetActorLocationAndRotation, which is a normal UFUNCTION call we
+-- already know works.
 
 local log         = require("log")
 local player_mod  = require("player")
-
--- UEHelpers is part of UE4SS but it's a Lua module, not a global, so it
--- must be require()'d. We also try a couple of alternative paths and
--- fall back to the global if the user's install exposes it that way.
-local UEHelpers
-do
-    for _, name in ipairs({ "UEHelpers", "UEHelpers/UEHelpers" }) do
-        local ok, mod = pcall(require, name)
-        if ok and mod then UEHelpers = mod; break end
-    end
-    if not UEHelpers then UEHelpers = rawget(_G, "UEHelpers") end
-end
 
 local M = {}
 
 -- Class found in the UHT dump:
 -- /Game/Multiplayer/BP_HumanReplicated.BP_HumanReplicated_C
 local GHOST_CLASS_PATH = "/Game/Multiplayer/BP_HumanReplicated.BP_HumanReplicated_C"
+local GHOST_CLASS_NAME = "BP_HumanReplicated_C"
 
--- ghosts[playerId] = { actor = AActor }
+-- ghosts[playerId] = { actor, summoned_at_ms }
 local ghosts        = {}
--- Players whose first spawn attempt threw. We don't retry them every
--- tick (the error would be the same), only on F7 / lobby rejoin.
-local spawn_failed  = {}
-local cached_class  = nil
+-- Players for whom we already issued a summon and didn't get an actor.
+-- We don't retry every tick so we don't spam summons.
+local summon_failed = {}
+
+-- Toggle: if anything still crashes, set this to false and you'll only
+-- get [GHOST_DATA] logs without any in-world body.
+local SUMMON_ENABLED = true
 
 local function is_valid(obj)
     if obj == nil then return false end
@@ -40,79 +41,96 @@ local function is_valid(obj)
     return ok and v == true
 end
 
-local function get_class()
-    if is_valid(cached_class) then return cached_class end
-    local ok, c = pcall(StaticFindObject, GHOST_CLASS_PATH)
-    if ok and is_valid(c) then
-        cached_class = c
-        log.debug("Ghost class resolved: %s", GHOST_CLASS_PATH)
-        return c
-    end
-    return nil
-end
-
--- Three fallback strategies for getting a UWorld pointer.
--- Picking the right one depends on the UE4SS version the player has.
-local function get_world()
-    -- 1. The local player has a GetWorld() method - we already have it
-    --    cached and validated, so this is the safest path.
+-- Get the local PlayerController, which owns ConsoleCommand.
+local function get_pc()
     local p = player_mod.get_local_player()
-    if p and p.GetWorld then
-        local ok, w = pcall(function() return p:GetWorld() end)
-        if ok and is_valid(w) then return w end
+    if p and p.GetController then
+        local ok, c = pcall(function() return p:GetController() end)
+        if ok and is_valid(c) then return c end
     end
-    -- 2. UEHelpers (if the require() above succeeded)
-    if UEHelpers and UEHelpers.GetWorld then
-        local ok, w = pcall(UEHelpers.GetWorld)
-        if ok and is_valid(w) then return w end
+    -- Fallbacks
+    for _, name in ipairs({ "PlayerController", "BP_PlayerController_C" }) do
+        local ok, pc = pcall(FindFirstOf, name)
+        if ok and is_valid(pc) then
+            local fname = ""
+            pcall(function() fname = pc:GetFullName() end)
+            if not fname:find("Default__") then return pc end
+        end
     end
-    -- 3. Brute-force scan of all UObjects for any UWorld instance.
-    local ok, w = pcall(FindFirstOf, "World")
-    if ok and is_valid(w) then return w end
     return nil
 end
 
--- Returns AActor or (nil, err_string). Never throws - all paths are
--- pcall-wrapped, so the caller can handle errors without nuking the
--- whole tick handler.
-local function try_spawn(state)
-    local ok, result, err = pcall(function()
-        local world = get_world()
-        if not world then return nil, "no world (am I in a level?)" end
-
-        local class = get_class()
-        if not class then return nil, "class missing: " .. GHOST_CLASS_PATH end
-
-        local loc = { X = state.x,            Y = state.y,         Z = state.z }
-        local rot = { Pitch = state.pitch or 0, Yaw = state.yaw or 0, Roll = 0 }
-
-        -- Strategy 1: simple world:SpawnActor(class, loc, rot)
-        local ok1, a1 = pcall(function() return world:SpawnActor(class, loc, rot) end)
-        if ok1 and is_valid(a1) then return a1 end
-
-        -- Strategy 2: GameplayStatics' deferred-spawn dance
-        local ok_gs, gs = pcall(StaticFindObject, "/Script/Engine.Default__GameplayStatics")
-        if ok_gs and is_valid(gs) then
-            local transform = {
-                Translation = loc,
-                Rotation    = { X = 0, Y = 0, Z = 0, W = 1 },
-                Scale3D     = { X = 1, Y = 1, Z = 1 },
-            }
-            local ok2, a2 = pcall(function()
-                local a = gs:BeginDeferredActorSpawnFromClass(world, class, transform, 0, nil)
+-- Snapshot the set of currently-existing BP_HumanReplicated_C instances
+-- so we can detect the one that gets created by our summon command.
+local function snapshot_existing()
+    local set = {}
+    pcall(function()
+        local all = FindAllOf(GHOST_CLASS_NAME)
+        if all then
+            for _, a in ipairs(all) do
                 if is_valid(a) then
-                    gs:FinishSpawningActor(a, transform)
-                    return a
+                    local n
+                    pcall(function() n = a:GetFullName() end)
+                    if n then set[n] = true end
                 end
-                return nil
-            end)
-            if ok2 and is_valid(a2) then return a2 end
+            end
         end
-
-        return nil, ("all spawn strategies failed (world ok, class ok, but SpawnActor returned invalid)")
     end)
-    if not ok then return nil, "exception: " .. tostring(result) end
-    return result, err
+    return set
+end
+
+-- Try to find a freshly-summoned BP_HumanReplicated_C that wasn't in the
+-- snapshot we took before the summon command.
+local function find_new_after(snapshot)
+    local found = nil
+    pcall(function()
+        local all = FindAllOf(GHOST_CLASS_NAME)
+        if not all then return end
+        for _, a in ipairs(all) do
+            if is_valid(a) then
+                local n = ""
+                pcall(function() n = a:GetFullName() end)
+                if n ~= "" and not n:find("Default__") and not snapshot[n] then
+                    found = a
+                    return
+                end
+            end
+        end
+    end)
+    return found
+end
+
+-- Issue the native UE "summon" command. This is the core trick that
+-- avoids the ProcessEvent crash documented in UE4SS issue #527.
+local function summon_ghost(player_name)
+    local pc = get_pc()
+    if not pc then return nil, "no PlayerController (am I in a level?)" end
+    if not pc.ConsoleCommand then return nil, "PlayerController.ConsoleCommand not available" end
+
+    local before = snapshot_existing()
+    local cmd = "summon " .. GHOST_CLASS_PATH
+
+    local ok, err = pcall(function() pc:ConsoleCommand(cmd, false) end)
+    if not ok then return nil, "ConsoleCommand threw: " .. tostring(err) end
+
+    -- The actor is created synchronously inside Exec, but its FullName
+    -- might race with FindAllOf indexing. Try a couple of times.
+    local actor = find_new_after(before)
+    if not actor then
+        -- One more attempt after a short tick delay -- but we can't
+        -- block here, so we just retry a couple of times in a tight
+        -- loop. UE4SS FindAllOf rebuilds its cache on demand.
+        for _ = 1, 3 do
+            actor = find_new_after(before)
+            if actor then break end
+        end
+    end
+    if not actor then
+        return nil, "summon issued but new actor not found in FindAllOf"
+    end
+    log.info("Summoned ghost via ConsoleCommand for %s -> %s",
+        player_name or "?", actor:GetFullName())
+    return actor
 end
 
 local function move_ghost(actor, state)
@@ -123,8 +141,11 @@ local function move_ghost(actor, state)
     end)
 end
 
--- Apply a server snapshot. `players` is an array of:
---   { id, name, isHost, state = { x, y, z, yaw, pitch } | nil }
+local function destroy_ghost(actor)
+    if not is_valid(actor) then return end
+    pcall(function() actor:K2_DestroyActor() end)
+end
+
 function M.update_from_snapshot(players)
     local seen = {}
     for _, p in ipairs(players or {}) do
@@ -133,15 +154,16 @@ function M.update_from_snapshot(players)
             local g = ghosts[p.id]
             if g and is_valid(g.actor) then
                 move_ghost(g.actor, p.state)
-            elseif not spawn_failed[p.id] then
-                local actor, err = try_spawn(p.state)
+            elseif SUMMON_ENABLED and not summon_failed[p.id] then
+                local actor, err = summon_ghost(p.name)
                 if actor then
-                    log.info("Spawned ghost for %s (%s) at %.0f,%.0f,%.0f",
-                        p.name or "?", p.id, p.state.x, p.state.y, p.state.z)
                     ghosts[p.id] = { actor = actor }
+                    -- Teleport immediately so the new actor doesn't sit
+                    -- on top of the local player for a frame.
+                    move_ghost(actor, p.state)
                 else
-                    spawn_failed[p.id] = true
-                    log.error("Spawn failed for %s: %s", p.name or "?", tostring(err))
+                    summon_failed[p.id] = true
+                    log.error("Summon failed for %s: %s", p.name or "?", tostring(err))
                     log.info("[GHOST_DATA] %s @ %.0f,%.0f,%.0f yaw=%.0f (no actor; data still flowing)",
                         p.name or "?", p.state.x, p.state.y, p.state.z, p.state.yaw or 0)
                 end
@@ -151,26 +173,22 @@ function M.update_from_snapshot(players)
             end
         end
     end
-    -- Despawn ghosts for players who left the lobby
+    -- Despawn ghosts for players who left
     for id, g in pairs(ghosts) do
         if not seen[id] then
-            if is_valid(g.actor) then
-                pcall(function() g.actor:K2_DestroyActor() end)
-            end
-            ghosts[id]       = nil
-            spawn_failed[id] = nil
+            destroy_ghost(g.actor)
+            ghosts[id]        = nil
+            summon_failed[id] = nil
         end
     end
 end
 
 function M.cleanup()
     for _, g in pairs(ghosts) do
-        if is_valid(g.actor) then
-            pcall(function() g.actor:K2_DestroyActor() end)
-        end
+        destroy_ghost(g.actor)
     end
     ghosts        = {}
-    spawn_failed  = {}
+    summon_failed = {}
 end
 
 function M.count()
@@ -179,9 +197,8 @@ function M.count()
     return n
 end
 
--- Re-arm spawn attempts (used by F7 force-rejoin in main.lua)
 function M.reset_failures()
-    spawn_failed = {}
+    summon_failed = {}
 end
 
 return M
