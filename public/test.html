@@ -48,6 +48,12 @@
       const code = $('code').value.toUpperCase();
       const name = $('name').value;
       if (!code) return;
+      // Close any previous connection from this tab to avoid duplicate sessions
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        ws.onmessage = null;
+        ws.onclose = null;
+        ws.close();
+      }
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(`${proto}//${location.host}/ws?code=${code}&name=${encodeURIComponent(name)}`);
       $('status').textContent = 'connecting...';
